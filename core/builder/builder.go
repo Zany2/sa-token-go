@@ -311,9 +311,12 @@ func (b *Builder) Validate() error {
 		return fmt.Errorf("MaxRefresh must be >= -1, got: %d", b.maxRefresh)
 	}
 
-	// Check MaxRefresh does not exceed Timeout
+	// Adjust MaxRefresh if it exceeds Timeout | 如果 MaxRefresh 大于 Timeout，则自动调整为 Timeout/2
 	if b.timeout != config.NoLimit && b.maxRefresh > b.timeout {
-		return fmt.Errorf("MaxRefresh (%d) cannot be greater than Timeout (%d)", b.maxRefresh, b.timeout)
+		b.maxRefresh = b.timeout / 2
+		if b.maxRefresh < 1 {
+			b.maxRefresh = 1
+		}
 	}
 
 	// Check RenewInterval
@@ -358,11 +361,6 @@ func (b *Builder) Build() *manager.Manager {
 	// Validate configuration | 验证配置
 	if err := b.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid configuration: %v", err))
-	}
-
-	// Automatically adjust MaxRefresh if user customized Timeout but didn't set MaxRefresh | 自动调整MaxRefresh逻辑
-	if b.timeout != config.DefaultTimeout && b.maxRefresh == config.DefaultTimeout/2 {
-		b.maxRefresh = b.timeout / 2
 	}
 
 	cfg := &config.Config{
