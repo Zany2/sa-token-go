@@ -472,6 +472,23 @@ func (s *Session) ReplaceTerminals(ctx context.Context, terminals []TerminalInfo
 	return s.save(ctx, ttl...)
 }
 
+// PushTerminalAndEvictOldest removes the oldest terminal (if any), appends the new one, and returns the evicted terminal | 删除最早终端（如有）、追加新终端，并返回被删除的终端
+func (s *Session) PushTerminalAndEvictOldest(ctx context.Context, terminal TerminalInfo, ttl ...time.Duration) (TerminalInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var evicted TerminalInfo
+	if len(s.TerminalInfos) > 0 {
+		evicted = s.TerminalInfos[0]          // 保存被删除的最早终端
+		s.TerminalInfos = s.TerminalInfos[1:] // 移除第一个
+	}
+
+	s.TerminalInfos = append(s.TerminalInfos, terminal)
+
+	err := s.save(ctx, ttl...)
+	return evicted, err
+}
+
 // ClearTerminalInfos clears all terminals | 清空所有终端信息
 func (s *Session) ClearTerminalInfos(ctx context.Context, ttl ...time.Duration) error {
 	s.mu.Lock()

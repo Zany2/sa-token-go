@@ -189,6 +189,11 @@ func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (
 	expiration := m.getExpiration()
 	// Get device type | 获取设备类型
 	deviceType := m.getDevice(device...)
+	// Generate token | 生成Token
+	tokenValue, err := m.generator.Generate(loginID, deviceType)
+	if err != nil {
+		return "", err
+	}
 
 	// Handle share login behavior | 处理共享登录逻辑
 	if m.config.IsShare {
@@ -212,17 +217,11 @@ func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (
 
 	} else if m.config.MaxLoginCount > 0 && !m.config.IsShare {
 		// Concurrent login allowed but limited by MaxLoginCount | 允许并发登录但受 MaxLoginCount 限制
-		if err := m.checkTerminalInfosValid(ctx, sess); err == nil {
-			if int64(len(sess.TerminalInfos)) >= m.config.MaxLoginCount {
-				return "", core.ErrLoginLimitExceeded
-			}
-		}
-	}
-
-	// Generate token | 生成Token
-	tokenValue, err := m.generator.Generate(loginID, deviceType)
-	if err != nil {
-		return "", err
+		oldestTerminalInfo, _ := sess.PushTerminalAndEvictOldest(ctx, session.TerminalInfo{
+			Token:  tokenValue,
+			Device: deviceType,
+		})
+		_ = m.removeTokenChain(ctx, oldestTerminalInfo.Token, listener.EventKickout)
 	}
 
 	// Current timestamp | 当前时间戳
@@ -291,65 +290,115 @@ func (m *Manager) LoginByToken(ctx context.Context, tokenValue string) error {
 
 // Logout Logout | 登出
 func (m *Manager) Logout(ctx context.Context, tokenValue string) error {
-	err := m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventLogout)
+	// Get token info | 获取Token信息
+	tokenInfo, err := m.getTokenInfo(ctx, tokenValue, true)
 	if err != nil {
 		return err
 	}
-	_ = m.checkTerminalInfosValid(ctx, nil)
+	sess, err := m.GetSession(ctx, tokenInfo.LoginID)
+	if err != nil {
+		return err
+	}
+
+	// Remove token chain | 删除Token
+	err = m.removeTokenChain(ctx, tokenValue, listener.EventLogout)
+	if err != nil {
+		return err
+	}
+
+	// Check terminal info validity | 检查终端信息是否有效
+	err = m.checkTerminalInfosValid(ctx, sess)
+	if err != nil {
+		return err
+	}
+
+	// Trigger event notification | 触发事件通知
+	if m.eventManager != nil {
+		m.eventManager.Trigger(&listener.EventData{
+			Event:    listener.EventLogout,
+			AuthType: m.config.AuthType,
+			LoginID:  tokenInfo.LoginID,
+			Device:   tokenInfo.Device,
+			Token:    tokenValue,
+		})
+	}
+
 	return err
 }
 
 // LogoutByDevice Logout by device | 根据设备类型登出
 func (m *Manager) LogoutByDevice(ctx context.Context, loginID string, device ...string) error {
+	// Get session | 获取Session
 	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return err
 	}
 
+	// Remove terminal info by device | 根据设备类型删除终端信息
 	tokenList, err := sess.RemoveTerminalInfosByDevice(ctx, m.getDevice(device...), m.getExpiration())
 	if err != nil {
 		return err
 	}
 
-	return m.storage.Delete(ctx, tokenList...)
+	// Remove token chain | 删除Token
+	err = m.storage.Delete(ctx, tokenList...)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ============ Online Status Management | 在线状态管理 ============
 
 // Kickout Kick user offline | 踢人下线
 func (m *Manager) Kickout(ctx context.Context, tokenValue string) error {
-	return m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventKickout)
+	sess, err := m.GetSession(ctx, tokenValue)
+	if err != nil {
+		return err
+	}
+
+	err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
+	if err != nil {
+		return err
+	}
+
+	// Remove token chain | 删除Token
+	err = m.removeTokenChain(ctx, tokenValue, listener.EventKickout)
+	if err != nil {
+		return err
+	}
+
+	err = m.checkTerminalInfosValid(ctx, sess)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // KickoutByDeviceAndDeviceId by DeviceAndDeviceId | 根据设备类型和设备ID踢人下线
-func (m *Manager) KickoutByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
-	if loginID == "" {
-		return core.ErrInvalidLoginID
-	}
-
-	deviceType, deviceId := m.getDeviceAndDeviceId(deviceAndDeviceId...)
+func (m *Manager) KickoutByDeviceAndDeviceId(ctx context.Context, loginID string, device ...string) error {
 	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return err
 	}
 
-	tokens, err := m.collectActiveTokens(ctx, sess, func(info session.TerminalInfo) bool {
-		if deviceType != "" && info.Device != deviceType {
-			return false
-		}
-		if deviceId != "" && info.DeviceId != deviceId {
-			return false
-		}
-		return true
-	})
+	tokenList, err := sess.RemoveTerminalInfosByDevice(ctx, m.getDevice(device...))
 	if err != nil {
 		return err
 	}
 
-	for _, tokenValue := range tokens {
-		if err := m.removeTokenChain(ctx, tokenValue, nil, sess, listener.EventKickout); err != nil {
+	for _, token := range tokenList {
+		err := m.removeTokenChain(ctx, token, listener.EventKickout)
+		if err != nil {
 			return err
 		}
+	}
+
+	err = m.checkTerminalInfosValid(ctx, sess)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -357,38 +406,52 @@ func (m *Manager) KickoutByDeviceAndDeviceId(ctx context.Context, loginID string
 
 // Replace user offline | 顶人下线
 func (m *Manager) Replace(ctx context.Context, tokenValue string) error {
-	return m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventReplace)
+	sess, err := m.GetSession(ctx, tokenValue)
+	if err != nil {
+		return err
+	}
+
+	err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
+	if err != nil {
+		return err
+	}
+
+	// Remove token chain | 删除Token
+	err = m.removeTokenChain(ctx, tokenValue, listener.EventReplace)
+	if err != nil {
+		return err
+	}
+
+	err = m.checkTerminalInfosValid(ctx, sess)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ReplaceByDeviceAndDeviceId user offline by DeviceAndDeviceId | 根据设备类型和设备ID顶人下线
-func (m *Manager) ReplaceByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
-	if loginID == "" {
-		return core.ErrInvalidLoginID
-	}
-
-	deviceType, deviceId := m.getDeviceAndDeviceId(deviceAndDeviceId...)
+func (m *Manager) ReplaceByDeviceAndDeviceId(ctx context.Context, loginID string, device ...string) error {
 	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return err
 	}
 
-	tokens, err := m.collectActiveTokens(ctx, sess, func(info session.TerminalInfo) bool {
-		if deviceType != "" && info.Device != deviceType {
-			return false
-		}
-		if deviceId != "" && info.DeviceId != deviceId {
-			return false
-		}
-		return true
-	})
+	tokenList, err := sess.RemoveTerminalInfosByDevice(ctx, m.getDevice(device...))
 	if err != nil {
 		return err
 	}
 
-	for _, tokenValue := range tokens {
-		if err := m.removeTokenChain(ctx, tokenValue, nil, sess, listener.EventReplace); err != nil {
+	for _, token := range tokenList {
+		err := m.removeTokenChain(ctx, token, listener.EventReplace)
+		if err != nil {
 			return err
 		}
+	}
+
+	err = m.checkTerminalInfosValid(ctx, sess)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -408,8 +471,10 @@ func (m *Manager) IsLogin(ctx context.Context, tokenValue string) bool {
 	if m.config.ActiveTimeout > 0 {
 		now := time.Now().Unix()
 		if now-info.ActiveTime > m.config.ActiveTimeout {
-			// 设置TokenInfo为踢下线并且删除session中列表的设备
-			_ = m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventKickout)
+			if sess, err := m.GetSessionByToken(ctx, info.LoginID); err == nil && sess != nil {
+				_ = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
+			}
+			_ = m.removeTokenChain(ctx, tokenValue, listener.EventKickout)
 			return false
 		}
 	}
@@ -425,7 +490,7 @@ func (m *Manager) IsLogin(ctx context.Context, tokenValue string) bool {
 			if ttlSeconds > 0 && (m.config.MaxRefresh <= 0 || ttlSeconds <= m.config.MaxRefresh) && (m.config.RenewInterval <= 0 || !m.storage.Exists(ctx, m.getRenewKey(tokenValue))) {
 				// 构造续期函数
 				renewFunc := func() {
-					m.renewToken(context.Background(), tokenValue, info)
+					m.renewToken(context.Background(), tokenValue, nil, nil)
 				}
 				// Submit renewal task to the pool if configured, otherwise use a goroutine | 如果配置了续期池，则提交续期任务到池中，否则使用协程
 				if m.pool != nil {
@@ -477,51 +542,17 @@ func (m *Manager) IsLoginByDeviceAndDeviceId(ctx context.Context, loginID string
 
 // GetLoginID Gets login ID from token | 根据Token获取登录ID
 func (m *Manager) GetLoginID(ctx context.Context, tokenValue string) (string, error) {
-	// Check if the user is logged in | 检查用户是否已登录
-	if m.IsLogin(ctx, tokenValue) {
-		// Retrieve the login ID without checking token validity | 获取登录ID 不检查Token有效性
-		return m.GetLoginIDNotCheck(ctx, tokenValue)
-	}
-
-	if _, err := m.getTokenInfo(ctx, tokenValue, true); err != nil {
-		return "", err
-	}
-
-	return "", core.ErrTokenExpired
-}
-
-// GetLoginIDNotCheck Gets login ID without checking token validity | 获取登录ID 不验证和续期Token
-func (m *Manager) GetLoginIDNotCheck(ctx context.Context, tokenValue string) (string, error) {
-	// Get token info | 获取Token信息
-	info, err := m.getTokenInfo(ctx, tokenValue)
+	tokenInfo, err := m.getTokenInfo(ctx, tokenValue, true)
 	if err != nil {
 		return "", err
 	}
 
-	return info.LoginID, nil
+	return tokenInfo.LoginID, nil
 }
 
 // GetTokenInfo Gets token information | 获取Token信息
 func (m *Manager) GetTokenInfo(ctx context.Context, tokenValue string) (*TokenInfo, error) {
 	return m.getTokenInfo(ctx, tokenValue)
-}
-
-// GetTokenInfoByDeviceAndDeviceId Gets token information by DeviceAndDeviceId | 根据设备类型和设备ID获取Token信息
-func (m *Manager) GetTokenInfoByDeviceAndDeviceId(ctx context.Context, deviceAndDeviceId ...string) (*TokenInfo, error) {
-	loginID := utils.GetCtxValue(ctx, SessionKeyLoginID)
-	if loginID == "" {
-		return nil, core.ErrInvalidLoginIDEmpty
-	}
-
-	tokens, err := m.GetTokenValueListByDeviceAndDeviceId(ctx, loginID, deviceAndDeviceId...)
-	if err != nil {
-		return nil, err
-	}
-	if len(tokens) == 0 {
-		return nil, core.ErrTokenExpired
-	}
-
-	return m.getTokenInfo(ctx, tokens[0], true)
 }
 
 // ============ Account Disable | 账号封禁 ============
@@ -553,12 +584,24 @@ func (m *Manager) Disable(ctx context.Context, loginID string, duration time.Dur
 	}
 
 	// Check if the account has active sessions and force logout | 检查账号是否有活跃会话并强制下线
-	tokens, err := m.GetTokenValueListByLoginID(ctx, loginID)
-	if err == nil && len(tokens) > 0 {
-		for _, tokenValue := range tokens {
-			// Force kick out each active token | 强制踢出所有活跃的Token
-			_ = m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventKickout)
-		}
+	sess, err := m.GetSession(ctx, loginID)
+	if err != nil {
+		return err
+	}
+	// Destroy the session | 销毁Session
+	err = sess.Destroy(ctx)
+	if err != nil {
+		return err
+	}
+
+	tokenList := make([]string, len(sess.TerminalInfos))
+	for _, info := range sess.TerminalInfos {
+		tokenList = append(tokenList, info.Token)
+	}
+	// Delete tokens from storage | 删除Token
+	err = m.storage.Delete(ctx, tokenList...)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -593,10 +636,6 @@ func (m *Manager) GetDisableInfo(ctx context.Context, loginID string) (*DisableI
 	data, err := m.storage.Get(ctx, disableKeyKey)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-	if data == nil {
-		// 注意 这里返回一个空的DisableInfo对象，而不是返回nil 不然取值时会panic
-		return &DisableInfo{}, nil
 	}
 
 	// 将数据转换为字节数组
@@ -677,54 +716,47 @@ func (m *Manager) GetSessionByToken(ctx context.Context, tokenValue string) (*se
 // ============ Token & Session Info | Token 与会话信息查询 ============
 
 // GetTokenValueListByLoginID Gets all tokens for specified account | 获取指定账号的所有Token
-func (m *Manager) GetTokenValueListByLoginID(ctx context.Context, loginID string) ([]string, error) {
-	if loginID == "" {
-		return nil, core.ErrInvalidLoginID
-	}
-
+func (m *Manager) GetTokenValueListByLoginID(ctx context.Context, loginID string, checkAlive ...bool) ([]string, error) {
 	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return nil, err
 	}
 
-	tokens, err := m.collectActiveTokens(ctx, sess, nil)
-	if err != nil {
-		return nil, err
+	tokenList := make([]string, len(sess.TerminalInfos))
+	for _, info := range sess.TerminalInfos {
+		if len(checkAlive) > 0 && checkAlive[0] {
+			_, err = m.getTokenInfo(ctx, info.Token, true)
+			if err != nil {
+				continue
+			}
+		}
+		tokenList = append(tokenList, info.Token)
 	}
-	if tokens == nil {
-		return []string{}, nil
-	}
-	return tokens, nil
+
+	return tokenList, nil
 }
 
 // GetTokenValueListByDeviceAndDeviceId Gets all tokens for specified device and device ID | 获取指定设备类型和设备ID的所有Token
-func (m *Manager) GetTokenValueListByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) ([]string, error) {
-	if loginID == "" {
-		return nil, core.ErrInvalidLoginID
-	}
-
-	deviceType, deviceId := m.getDeviceAndDeviceId(deviceAndDeviceId...)
+func (m *Manager) GetTokenValueListByDeviceAndDeviceId(ctx context.Context, loginID string, device string, checkAlive ...bool) ([]string, error) {
 	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return nil, err
 	}
 
-	tokens, err := m.collectActiveTokens(ctx, sess, func(info session.TerminalInfo) bool {
-		if deviceType != "" && info.Device != deviceType {
-			return false
+	tokenList := make([]string, len(sess.TerminalInfos))
+	for _, info := range sess.TerminalInfos {
+		if len(checkAlive) > 0 && checkAlive[0] {
+			_, err = m.getTokenInfo(ctx, info.Token, true)
+			if err != nil {
+				continue
+			}
 		}
-		if deviceId != "" && info.DeviceId != deviceId {
-			return false
+		if info.Device == device {
+			tokenList = append(tokenList, info.Token)
 		}
-		return true
-	})
-	if err != nil {
-		return nil, err
 	}
-	if tokens == nil {
-		return []string{}, nil
-	}
-	return tokens, nil
+
+	return tokenList, nil
 }
 
 // ============ Permission Validation | 权限验证 ============
@@ -1476,23 +1508,7 @@ func (m *Manager) renewToken(ctx context.Context, tokenValue string, info *Token
 }
 
 // removeTokenChain Removes all related keys and triggers event | 删除Token相关的所有键并触发事件
-func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, tokenInfo *TokenInfo, sess *session.Session, event listener.Event) error {
-	// Get token info if not provided | 如果未提供Token信息，则获取Token信息
-	if tokenInfo == nil {
-		var err error
-		if tokenInfo, err = m.getTokenInfo(ctx, tokenValue); err != nil {
-			return err
-		}
-	}
-
-	// Get session if not provided | 如果未提供Session，则获取Session
-	if sess == nil {
-		var err error
-		if sess, err = m.GetSession(ctx, tokenInfo.LoginID); err != nil {
-			return err
-		}
-	}
-
+func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, event listener.Event) error {
 	// Construct the token storage key | 构造Token存储键
 	tokenKey := m.getTokenKey(tokenValue)
 	// Construct the renewal key | 构造续期标记
@@ -1508,23 +1524,14 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, token
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		// Remove terminal by token | 根据Token删除终端信息
-		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
-		if err != nil {
-			return err
-		}
 
 	// EventKickout User kicked offline | 用户被踢下线
 	case listener.EventKickout:
 		// Mark as kicked out but keep TTL | 标记为被踢下线，保留原TTL
 		err := m.storage.SetKeepTTL(ctx, tokenKey, string(TokenStateKickout))
 		if err != nil {
+
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-		}
-		// Remove terminal by token | 根据Token删除终端信息
-		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
-		if err != nil {
-			return err
 		}
 
 	// EventReplace User replaced by new login | 用户被顶下线
@@ -1534,11 +1541,6 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, token
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		// Remove terminal by token | 根据Token删除终端信息
-		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
-		if err != nil {
-			return err
-		}
 
 	// Default Unknown event type | 未知事件类型（默认删除）
 	default:
@@ -1547,21 +1549,6 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, token
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
-		if err != nil {
-			return err
-		}
-	}
-
-	// Trigger event notification | 触发事件通知
-	if m.eventManager != nil {
-		m.eventManager.Trigger(&listener.EventData{
-			Event:    event,
-			AuthType: m.config.AuthType,
-			LoginID:  tokenInfo.LoginID,
-			Device:   tokenInfo.Device,
-			Token:    tokenValue,
-		})
 	}
 
 	return nil
@@ -1691,10 +1678,6 @@ func (m *Manager) toStringSlice(v any) []string {
 
 // checkTerminalInfosValid checks whether the terminals information is valid | 检查终端列表信息是否有效
 func (m *Manager) checkTerminalInfosValid(ctx context.Context, sess *session.Session) error {
-	if sess == nil {
-		return
-	}
-
 	terminalInfos := make([]session.TerminalInfo, len(sess.TerminalInfos))
 	for _, info := range sess.TerminalInfos {
 		_, err := m.getTokenInfo(ctx, info.Token, true)
