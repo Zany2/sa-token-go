@@ -5,51 +5,65 @@ import (
 	"fmt"
 	codec_json "github.com/click33/sa-token-go/codec/json"
 	"github.com/click33/sa-token-go/core"
+	"github.com/click33/sa-token-go/core/adapter"
 	"github.com/click33/sa-token-go/storage/memory"
 	"sync"
 	"time"
-
-	"github.com/click33/sa-token-go/core/adapter"
 )
 
 // Session Session object for storing user data | 会话对象，用于存储用户数据
 type Session struct {
-	AuthType   string         `json:"authType"`   // Authentication system type | 认证体系类型
-	ID         string         `json:"id"`         // Session ID | Session标识
-	CreateTime int64          `json:"createTime"` // Creation time | 创建时间
-	Data       map[string]any `json:"data"`       // Session data | 数据
+	AuthType      string         `json:"authType"`      // Authentication system type | 认证体系类型
+	ID            string         `json:"id"`            // Session ID | Session标识
+	CreateTime    int64          `json:"createTime"`    // Creation time | 创建时间
+	TerminalInfos []TerminalInfo `json:"terminalInfos"` // TerminalInfos Information | 终端信息
+	Permissions   []string       `json:"permissions"`   // Permissions Information | 权限信息
+	Roles         []string       `json:"roles"`         // Roles Information | 角色信息
 
 	prefix     string          `json:"-" msgpack:"-"` // Key prefix | 键前缀
 	mu         sync.RWMutex    `json:"-" msgpack:"-"` // Read-write lock | 读写锁
-	storage    adapter.Storage `json:"-" msgpack:"-"` // Storage adapter (Redis, Memory, etc.) | 存储适配器（如 Redis、Memory）
-	serializer adapter.Codec   `json:"-" msgpack:"-"` // Codec adapter for encoding and decoding operations | 编解码器适配器
+	storage    adapter.Storage `json:"-" msgpack:"-"` // Storage adapter | 存储适配器
+	serializer adapter.Codec   `json:"-" msgpack:"-"` // Serializer adapter | 序列化器
+}
+
+// TerminalInfo terminal information | 终端信息
+type TerminalInfo struct {
+	Token  string `json:"token"`  // Token value | 令牌
+	Device string `json:"device"` // Device type | 设备类型
 }
 
 // NewSession Creates a new session | 创建新的Session
 func NewSession(authType, prefix, id string, storage adapter.Storage, serializer adapter.Codec) *Session {
+	// 创建一个内存存储适配器
 	if storage == nil {
 		storage = memory.NewStorage()
 	}
+	// 创建一个JSON序列化器
 	if serializer == nil {
 		serializer = codec_json.NewJSONSerializer()
 	}
 
+	// 创建一个新的Session
 	return &Session{
-		AuthType:   authType,
-		ID:         id,
-		CreateTime: time.Now().Unix(),
-		Data:       make(map[string]any),
-		prefix:     prefix,
-		storage:    storage,
-		serializer: serializer,
+		AuthType:      authType,
+		ID:            id,
+		CreateTime:    time.Now().Unix(),
+		TerminalInfos: make([]TerminalInfo, 0),
+		Permissions:   make([]string, 0),
+		Roles:         make([]string, 0),
+		prefix:        prefix,
+		storage:       storage,
+		serializer:    serializer,
 	}
 }
 
 // SetDependencies sets internal dependencies for a decoded session | 设置反序列化后的 Session 的内部依赖
 func (s *Session) SetDependencies(prefix string, storage adapter.Storage, serializer adapter.Codec) {
+	// 创建一个内存存储适配器
 	if storage == nil {
 		storage = memory.NewStorage()
 	}
+	// 创建一个JSON序列化器
 	if serializer == nil {
 		serializer = codec_json.NewJSONSerializer()
 	}
@@ -61,158 +75,310 @@ func (s *Session) SetDependencies(prefix string, storage adapter.Storage, serial
 
 // ============ Data Operations | 数据操作 ============
 
-// Set Sets value | 设置值
-func (s *Session) Set(ctx context.Context, key string, value any, ttl ...time.Duration) error {
-	if key == "" {
-		return core.ErrSessionInvalidDataKey
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.Data[key] = value
-
-	return s.save(ctx, ttl...)
-}
-
-// SetMulti sets multiple key-value pairs | 设置多个键值对
-func (s *Session) SetMulti(ctx context.Context, valueMap map[string]any, ttl ...time.Duration) error {
-	if len(valueMap) == 0 {
+// AddPermissions adds permissions | 新增权限
+func (s *Session) AddPermissions(ctx context.Context, permissions []string, ttl ...time.Duration) error {
+	if len(permissions) == 0 {
 		return nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for key, value := range valueMap {
-		if key == "" {
-			return core.ErrSessionInvalidDataKey
+	existing := make(map[string]struct{}, len(s.Permissions))
+	for _, p := range s.Permissions {
+		if p != "" {
+			existing[p] = struct{}{}
 		}
-		s.Data[key] = value
 	}
+
+	toAdd := make([]string, 0, len(permissions))
+	for _, p := range permissions {
+		if p == "" {
+			continue
+		}
+		if _, exists := existing[p]; exists {
+			continue
+		}
+		existing[p] = struct{}{}
+		toAdd = append(toAdd, p)
+	}
+
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	s.Permissions = append(s.Permissions, toAdd...)
+	return s.save(ctx, ttl...)
+}
+
+// AddRoles adds roles | 新增角色
+func (s *Session) AddRoles(ctx context.Context, roles []string, ttl ...time.Duration) error {
+	if len(roles) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing := make(map[string]struct{}, len(s.Roles))
+	for _, r := range s.Roles {
+		if r != "" {
+			existing[r] = struct{}{}
+		}
+	}
+
+	toAdd := make([]string, 0, len(roles))
+	for _, r := range roles {
+		if r == "" {
+			continue
+		}
+		if _, exists := existing[r]; exists {
+			continue
+		}
+		existing[r] = struct{}{}
+		toAdd = append(toAdd, r)
+	}
+
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	s.Roles = append(s.Roles, toAdd...)
+	return s.save(ctx, ttl...)
+}
+
+// RemovePermissions removes permissions | 删除权限
+func (s *Session) RemovePermissions(ctx context.Context, permissions []string, ttl ...time.Duration) error {
+	if len(permissions) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.Permissions) == 0 {
+		return nil
+	}
+
+	// 构建要删除的集合
+	removeSet := make(map[string]struct{}, len(permissions))
+	for _, p := range permissions {
+		if p != "" {
+			removeSet[p] = struct{}{}
+		}
+	}
+	if len(removeSet) == 0 {
+		return nil
+	}
+
+	// 原地删除（保持顺序）
+	w := 0 // write index
+	for r := 0; r < len(s.Permissions); r++ {
+		if _, shouldRemove := removeSet[s.Permissions[r]]; !shouldRemove {
+			if w != r {
+				s.Permissions[w] = s.Permissions[r]
+			}
+			w++
+		}
+	}
+
+	if w == len(s.Permissions) {
+		// 没有删除任何元素
+		return nil
+	}
+
+	// 截断 slice
+	s.Permissions = s.Permissions[:w]
 
 	return s.save(ctx, ttl...)
 }
 
-// Get Gets value | 获取值
-func (s *Session) Get(key string) (any, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	value, exists := s.Data[key]
-	return value, exists
-}
-
-// GetString gets string value | 获取字符串值
-func (s *Session) GetString(key string) string {
-	if value, exists := s.Get(key); exists {
-		if str, ok := value.(string); ok {
-			return str
-		}
+// RemoveRoles removes roles | 删除角色
+func (s *Session) RemoveRoles(ctx context.Context, roles []string, ttl ...time.Duration) error {
+	if len(roles) == 0 {
+		return nil
 	}
-	return ""
-}
 
-// GetInt gets integer value | 获取整数值
-func (s *Session) GetInt(key string) int {
-	if value, exists := s.Get(key); exists {
-		switch v := value.(type) {
-		case int:
-			return v
-		case int64:
-			return int(v)
-		case float64:
-			return int(v)
-		}
-	}
-	return 0
-}
-
-// GetInt64 获取int64值
-func (s *Session) GetInt64(key string) int64 {
-	if value, exists := s.Get(key); exists {
-		switch v := value.(type) {
-		case int64:
-			return v
-		case int:
-			return int64(v)
-		case float64:
-			return int64(v)
-		}
-	}
-	return 0
-}
-
-// GetBool 获取布尔值
-func (s *Session) GetBool(key string) bool {
-	if value, exists := s.Get(key); exists {
-		if b, ok := value.(bool); ok {
-			return b
-		}
-	}
-	return false
-}
-
-// Has 检查键是否存在
-func (s *Session) Has(key string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	_, exists := s.Data[key]
-	return exists
-}
-
-// Delete removes a key and preserves TTL | 删除键并保留 TTL
-func (s *Session) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	delete(s.Data, key)
-	return s.saveKeepTTL(ctx)
+	if len(s.Roles) == 0 {
+		return nil
+	}
+
+	removeSet := make(map[string]struct{}, len(roles))
+	for _, r := range roles {
+		if r != "" {
+			removeSet[r] = struct{}{}
+		}
+	}
+	if len(removeSet) == 0 {
+		return nil
+	}
+
+	w := 0
+	for r := 0; r < len(s.Roles); r++ {
+		if _, shouldRemove := removeSet[s.Roles[r]]; !shouldRemove {
+			if w != r {
+				s.Roles[w] = s.Roles[r]
+			}
+			w++
+		}
+	}
+
+	if w == len(s.Roles) {
+		return nil
+	}
+
+	s.Roles = s.Roles[:w]
+	return s.save(ctx, ttl...)
 }
 
-// Clear removes all keys but preserves TTL | 清空所有键并保留 TTL
-func (s *Session) Clear(ctx context.Context) error {
+// ClearPermissions clears all permissions | 清空所有权限
+func (s *Session) ClearPermissions(ctx context.Context, ttl ...time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.Data = make(map[string]any)
-	return s.saveKeepTTL(ctx)
-}
-
-// Keys Gets all keys | 获取所有键
-func (s *Session) Keys() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	keys := make([]string, 0, len(s.Data))
-	for key := range s.Data {
-		keys = append(keys, key)
+	if len(s.Permissions) == 0 {
+		return nil
 	}
-	return keys
+
+	s.Permissions = make([]string, 0)
+	return s.save(ctx, ttl...)
 }
 
-// Size Gets data count | 获取数据数量
-func (s *Session) Size() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// ClearRoles clears all roles | 清空所有角色
+func (s *Session) ClearRoles(ctx context.Context, ttl ...time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	return len(s.Data)
+	if len(s.Roles) == 0 {
+		return nil
+	}
+
+	s.Roles = make([]string, 0)
+	return s.save(ctx, ttl...)
 }
 
-// IsEmpty Checks if session has no data | 检查Session是否为空
-func (s *Session) IsEmpty() bool {
-	return s.Size() == 0
+// AddTerminal adds or updates a session terminal entry, preserving order | 添加或更新会话终端信息，保持原有顺序
+func (s *Session) AddTerminal(ctx context.Context, terminal TerminalInfo, ttl ...time.Duration) error {
+	if terminal.Token == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 查找是否已存在相同 Token（保持顺序：更新原位置）
+	for i, t := range s.TerminalInfos {
+		if t.Token == terminal.Token {
+			s.TerminalInfos[i] = terminal // 替换，位置不变
+			return s.save(ctx, ttl...)
+		}
+	}
+
+	// 不存在：追加到末尾（保持插入顺序）
+	s.TerminalInfos = append(s.TerminalInfos, terminal)
+	return s.save(ctx, ttl...)
+}
+
+// RemoveTerminalByToken removes terminals by token, preserving the order of remaining terminals | 根据令牌删除终端信息，保留剩余终端的原有顺序
+func (s *Session) RemoveTerminalByToken(ctx context.Context, token string, ttl ...time.Duration) error {
+	if token == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.TerminalInfos) == 0 {
+		return nil
+	}
+
+	w := 0
+	found := false
+	for r := 0; r < len(s.TerminalInfos); r++ {
+		if s.TerminalInfos[r].Token == token {
+			found = true
+			continue // 跳过要删除的
+		}
+		if w != r {
+			s.TerminalInfos[w] = s.TerminalInfos[r]
+		}
+		w++
+	}
+
+	if !found {
+		return nil
+	}
+
+	s.TerminalInfos = s.TerminalInfos[:w] // 截断，保持顺序
+	return s.save(ctx, ttl...)
+}
+
+// RemoveTerminalInfosByDevice removes terminals by device, preserving the order of remaining terminals | 根据设备类型删除终端信息，保留剩余终端的原有顺序
+func (s *Session) RemoveTerminalInfosByDevice(ctx context.Context, device string, ttl ...time.Duration) error {
+	if device == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.TerminalInfos) == 0 {
+		return nil
+	}
+
+	w := 0
+	found := false
+	for r := 0; r < len(s.TerminalInfos); r++ {
+		if s.TerminalInfos[r].Device == device {
+			found = true
+			continue // 跳过要删除的
+		}
+		if w != r {
+			s.TerminalInfos[w] = s.TerminalInfos[r]
+		}
+		w++
+	}
+
+	if !found {
+		return nil
+	}
+
+	s.TerminalInfos = s.TerminalInfos[:w] // 截断，保持顺序
+	return s.save(ctx, ttl...)
+}
+
+// ClearTerminalInfos clears all terminals | 清空所有终端信息
+func (s *Session) ClearTerminalInfos(ctx context.Context, ttl ...time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.TerminalInfos) == 0 {
+		return nil
+	}
+
+	s.TerminalInfos = make([]TerminalInfo, 0)
+	return s.save(ctx, ttl...)
 }
 
 // Renew extends the session TTL without modifying content | 续期 Session 的 TTL，但不修改内容
 func (s *Session) Renew(ctx context.Context, ttl time.Duration) error {
 	if ttl < 0 {
-		return nil // Skip renewal if ttl is invalid | 跳过无效续期
+		return nil
 	}
 
-	key := s.getStorageKey()
-	return s.storage.Expire(ctx, key, ttl)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Extend session TTL | 续期Session的TTL
+	err := s.storage.Expire(ctx, s.getStorageKey(), ttl)
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+	}
+
+	return nil
 }
 
 // Destroy Destroys session | 销毁Session
@@ -220,8 +386,13 @@ func (s *Session) Destroy(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	key := s.getStorageKey()
-	return s.storage.Delete(ctx, key)
+	// Delete session from storage | 删除Session
+	err := s.storage.Delete(ctx, s.getStorageKey())
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+	}
+
+	return nil
 }
 
 // ============ Internal Methods | 内部方法 ============
@@ -233,53 +404,54 @@ func (s *Session) getStorageKey() string {
 
 // save Saves session to storage | 保存到存储
 func (s *Session) save(ctx context.Context, ttl ...time.Duration) error {
-	data, err := s.serializer.Encode(s)
-	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrSerializeFailed, err)
-	}
+	// Check if a positive TTL is explicitly provided
+	if len(ttl) > 0 && ttl[0] > 0 {
+		// Serialize session | 序列化Session
+		data, err := s.serializer.Encode(s)
+		if err != nil {
+			return fmt.Errorf("%w: %v", core.ErrSerializeFailed, err)
+		}
 
-	key := s.getStorageKey()
-
-	// Default to 0 (no expiration) | 默认使用 0（无过期时间）
-	if len(ttl) == 0 || ttl[0] <= 0 {
-		err = s.storage.Set(ctx, key, data, 0)
+		// Save with the specified TTL
+		err = s.storage.Set(ctx, s.getStorageKey(), data, ttl[0])
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
+
 		return nil
 	}
 
-	// Save with provided TTL | 使用指定 TTL 保存
-	err = s.storage.Set(ctx, key, data, ttl[0])
-	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-
-	return nil
+	// No valid TTL provided: preserve existing TTL
+	return s.saveKeepTTL(ctx)
 }
 
 // saveKeepTTL saves session while preserving its TTL | 保存 Session 并保留现有 TTL
 func (s *Session) saveKeepTTL(ctx context.Context) error {
+	// Serialize session | 序列化Session
 	data, err := s.serializer.Encode(s)
 	if err != nil {
 		return fmt.Errorf("%w: %v", core.ErrSerializeFailed, err)
 	}
 
+	// Get storage key for this session | 获取Session的存储键
 	key := s.getStorageKey()
 
 	// Try to get current TTL | 获取当前 TTL
 	// -1: never expires | 永不过期
 	// -2: key not found | key不存在
 	// >0: remaining TTL | 剩余时间
-	ttl, _ := s.storage.TTL(ctx, key)
+	ttl, err := s.storage.TTL(ctx, key)
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+	}
 
-	// ttl <= 0 means: not found(-2), never expires(-1), or expired
-	// All these cases should save with no expiration | 这些情况都保存为永久
+	// ttl <= 0 means: not found(-2), never expires(-1), or expired | 这些情况都保存为永久
+	// ttl > 0: use original TTL | 使用原有TTL
 	if ttl <= 0 {
 		ttl = 0
 	}
-	// ttl > 0: use original TTL | 使用原有TTL
 
+	// Save to storage with expiration | 使用过期时间保存（0 表示永不过期）
 	err = s.storage.Set(ctx, key, data, ttl)
 	if err != nil {
 		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)

@@ -20,9 +20,6 @@ var (
 	// ErrTokenExpired indicates the token has expired | Token 已过期
 	ErrTokenExpired = fmt.Errorf("token expired: please login again to get a new token")
 
-	// ErrTokenNotFound indicates the token does not exist | Token 不存在
-	ErrTokenNotFound = fmt.Errorf("authentication required: token not found")
-
 	// ErrTokenKickout indicates the token has been kicked out | Token 已被踢下线
 	ErrTokenKickout = fmt.Errorf("authentication required: token has been kicked out")
 

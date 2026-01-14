@@ -172,60 +172,60 @@ func (m *Manager) CloseManager() {
 
 // ============ Authentication | 登录认证 ============
 
-// Login Performs user login and returns token | 登录 返回Token
+// Login login | 登录
 func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (string, error) {
 	// Check if account is disabled | 检查账号是否被封禁
 	if m.IsDisable(ctx, loginID) {
 		return "", core.ErrAccountDisabled
 	}
 
-	// Get device type | 获取设备类型
-	deviceType := getDevice(device)
-	// Get account key | 获取账号存储键
-	accountKey := m.getAccountKey(loginID, deviceType)
-	// Get existing token list of this account | 获取该账号下所有已登录Token
-	existingTokenList, err := m.GetTokenValueListByLoginID(ctx, loginID)
+	// Get session | 获取Session
+	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return "", err
 	}
 
-	// Handle shared token for concurrent login | 处理多人登录共用Token的情况
+	// Calculate expiration time | 计算过期时间
+	expiration := m.getExpiration()
+	// Get device type | 获取设备类型
+	deviceType := m.getDevice(device...)
+
+	// Handle share login behavior | 处理共享登录逻辑
 	if m.config.IsShare {
-		if len(existingTokenList) > 0 {
-			if isLoggedIn, err := m.IsLogin(ctx, existingTokenList[0]); isLoggedIn && err == nil {
-				return existingTokenList[0], nil
+		if len(sess.TerminalInfos) > 0 {
+			tokenValue := sess.TerminalInfos[0].Token
+			if isLogin := m.IsLogin(ctx, tokenValue); isLogin {
+				return tokenValue, nil
 			}
 		}
 	}
 
 	// Handle concurrent login behavior | 处理并发登录逻辑
 	if !m.config.IsConcurrent {
-		// Concurrent login not allowed Kickout all existing tokens | 不允许并发登录 踢掉所有Token
-		if len(existingTokenList) > 0 {
-			for _, token := range existingTokenList {
-				err = m.kickoutByToken(ctx, token)
-				return "", err
+		// Concurrent login not allowed Kickout all existing tokens | 不允许并发登录踢掉所有Token
+		if len(sess.TerminalInfos) > 0 {
+			tokenList := make([]string, len(sess.TerminalInfos))
+			for _, info := range sess.TerminalInfos {
+				tokenList = append(tokenList, info.Token)
 			}
+			_ = m.storage.Delete(ctx, tokenList...)
+			_ = sess.ClearTerminalInfos(ctx, expiration)
 		}
-
 	} else if m.config.MaxLoginCount > 0 && !m.config.IsShare {
 		// Concurrent login allowed but limited by MaxLoginCount | 允许并发登录但受 MaxLoginCount 限制
-		if int64(len(existingTokenList)) >= m.config.MaxLoginCount {
+		if int64(len(sess.TerminalInfos)) >= m.config.MaxLoginCount {
 			return "", core.ErrLoginLimitExceeded
 		}
 	}
 
 	// Generate token | 生成Token
-	tokenValue, err := m.generator.Generate(loginID, deviceType)
+	tokenValue, err := m.generator.Generate(loginID, device)
 	if err != nil {
 		return "", err
 	}
 
 	// Current timestamp | 当前时间戳
 	nowTime := time.Now().Unix()
-	// Calculate expiration time | 计算过期时间
-	expiration := m.getExpiration()
-
 	// Prepare TokenInfo object and serialize to JSON | 准备Token信息对象并序列化
 	tokenInfo, err := m.serializer.Encode(TokenInfo{
 		AuthType:   m.config.AuthType,
@@ -243,23 +243,13 @@ func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (
 		return "", fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 	}
 
-	// Save account-token mapping | 保存 AccountKey-Token 映射
-	if err = m.storage.Set(ctx, accountKey, tokenValue, expiration); err != nil {
-		return "", fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-
-	// Create session | 创建Session
-	if err = session.
-		NewSession(m.config.AuthType, m.config.KeyPrefix, loginID, m.storage, m.serializer).
-		SetMulti(
-			ctx,
-			map[string]any{
-				SessionKeyLoginID:   loginID,
-				SessionKeyDevice:    deviceType,
-				SessionKeyLoginTime: nowTime,
-			},
-			expiration,
-		); err != nil {
+	// Add terminal info to session | 添加终端信息到Session
+	err = sess.AddTerminal(ctx, session.TerminalInfo{
+		Token:    tokenValue,
+		Device:   device,
+		DeviceId: deviceId,
+	})
+	if err != nil {
 		return "", err
 	}
 
@@ -269,7 +259,7 @@ func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (
 			Event:    listener.EventLogin,
 			AuthType: m.config.AuthType,
 			LoginID:  loginID,
-			Device:   deviceType,
+			Device:   device,
 			Token:    tokenValue,
 		})
 	}
@@ -277,7 +267,7 @@ func (m *Manager) Login(ctx context.Context, loginID string, device ...string) (
 	return tokenValue, nil
 }
 
-// LoginByToken Login with specified token (for seamless token refresh) | 使用指定Token登录（用于token无感刷新）
+// LoginByToken Login with specified token | 根据指定Token登录
 func (m *Manager) LoginByToken(ctx context.Context, tokenValue string) error {
 	info, err := m.getTokenInfo(ctx, tokenValue)
 	if err != nil {
@@ -290,153 +280,97 @@ func (m *Manager) LoginByToken(ctx context.Context, tokenValue string) error {
 	}
 
 	// Renew token | 同步刷新Token
-	err = m.renewToken(context.Background(), tokenValue, info)
+	m.renewToken(ctx, tokenValue, info)
+
+	return nil
+}
+
+// LoginWithTimeOut Login with specified timeout | 根据指定超时时间登录
+func (m *Manager) LoginWithTimeOut(ctx context.Context, timeOut time.Duration) error {}
+
+// Logout Logout | 登出
+func (m *Manager) Logout(ctx context.Context, tokenValue string) error {
+	return m.removeTokenChain(ctx, tokenValue, nil, listener.EventLogout)
+}
+
+// LogoutByDeviceAndDeviceId by DeviceAndDeviceId | 根据设备类型和设备ID登出
+func (m *Manager) LogoutByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
+	// Get device type | 获取设备类型
+	deviceType := m.GetDevice(device)
+
+	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
 		return err
 	}
 
-	return nil
-}
-
-// Logout Performs user logout | 登出
-func (m *Manager) Logout(ctx context.Context, loginID string, device ...string) error {
-	// Get account key | 获取账号存储键
-	accountKey := m.getAccountKey(loginID, getDevice(device))
-
-	// Get token value | 获取Token值
-	tokenValue, err := m.storage.Get(ctx, accountKey)
-	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-	if tokenValue == nil {
-		return core.ErrNotLogin
-	}
-
-	// Assert token value type | 类型断言为字符串
-	tokenValueStr, ok := assertString(tokenValue)
-	if !ok {
-		return core.ErrTokenNotFound
-	}
-
-	return m.removeTokenChain(ctx, tokenValueStr, nil, listener.EventLogout)
-}
-
-// LogoutByToken Logout by token | 根据Token登出
-func (m *Manager) LogoutByToken(ctx context.Context, tokenValue string) error {
-	return m.removeTokenChain(ctx, tokenValue, nil, listener.EventLogout)
 }
 
 // ============ Online Status Management | 在线状态管理 ============
 
-// kickout Kick user offline (private) | 踢人下线（私有）
-func (m *Manager) kickout(ctx context.Context, loginID string, device string) error {
-	// Get the account key for this user and device | 获取该用户和设备对应的账户键
-	accountKey := m.getAccountKey(loginID, device)
+// Kickout Kick user offline | 踢人下线
+func (m *Manager) Kickout(ctx context.Context, tokenValue string) error {
+	return m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventKickout)
+}
 
-	// Retrieve the token associated with this account key from storage | 从存储中获取该账户键对应的 Token
-	tokenValue, err := m.storage.Get(ctx, accountKey)
+// KickoutByDeviceAndDeviceId by DeviceAndDeviceId | 根据设备类型和设备ID踢人下线
+func (m *Manager) KickoutByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
+	device, deviceId := m.getDeviceAndDeviceId(deviceAndDeviceId...)
+	if deviceId != "" {
+
+	}
+
+	sess, err := m.GetSession(ctx, loginID)
 	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+		return err
 	}
 
-	// If no token exists for this account key | 如果该账户键不存在 Token
-	if tokenValue == nil {
-		return core.ErrTokenNotFound
+	for _, info := range sess.TerminalInfos {
 	}
 
-	// Remove the token chain and trigger kickout event | 移除 Token 链并触发踢下线事件
-	if tokenValueStr, ok := assertString(tokenValue); ok {
-		return m.removeTokenChain(ctx, tokenValueStr, nil, listener.EventKickout)
-	}
-
-	return nil
 }
 
-// Kickout Kick user offline (public method) | 踢人下线（公开方法）
-func (m *Manager) Kickout(ctx context.Context, loginID string, device ...string) error {
-	return m.kickout(ctx, loginID, getDevice(device))
+// Replace user offline | 顶人下线
+func (m *Manager) Replace(ctx context.Context, tokenValue string) error {
+	return m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventReplace)
 }
 
-// kickoutByToken Kick user offline (private) | 根据Token踢人下线（私有）
-func (m *Manager) kickoutByToken(ctx context.Context, tokenValue string) error {
-	return m.removeTokenChain(ctx, tokenValue, nil, listener.EventKickout)
-}
-
-// KickoutByToken Kick user offline (public method) | 根据Token踢人下线（公开方法）
-func (m *Manager) KickoutByToken(ctx context.Context, tokenValue string) error {
-	return m.kickoutByToken(ctx, tokenValue)
-}
-
-// replace Replace user offline by login ID and device (private) | 根据账号和设备顶人下线（私有）
-func (m *Manager) replace(ctx context.Context, loginID string, device string) error {
-	// Get the account key for this user and device | 获取该用户和设备对应的账户键
-	accountKey := m.getAccountKey(loginID, device)
-
-	// Retrieve the token associated with this account key from storage | 从存储中获取该账户键对应的 Token
-	tokenValue, err := m.storage.Get(ctx, accountKey)
-	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-	// If no token exists for this account key | 如果该账户键不存在 Token
-	if tokenValue == nil {
-		return core.ErrTokenNotFound
-	}
-
-	// Remove the token chain and trigger replace event | 移除 Token 链并触发顶下线事件
-	if tokenValueStr, ok := assertString(tokenValue); ok {
-		return m.removeTokenChain(ctx, tokenValueStr, nil, listener.EventReplace)
-	}
-
-	return nil
-}
-
-// Replace user offline by login ID and device (public method) | 根据账号和设备顶人下线（公开方法）
-func (m *Manager) Replace(ctx context.Context, loginID string, device ...string) error {
-	return m.replace(ctx, loginID, getDevice(device))
-}
-
-// replaceByToken Replace user offline by token (private) | 根据Token顶人下线（私有）
-func (m *Manager) replaceByToken(ctx context.Context, tokenValue string) error {
-	return m.removeTokenChain(ctx, tokenValue, nil, listener.EventReplace)
-}
-
-// ReplaceByToken Replace user offline by token (public method) | 根据Token顶人下线（公开方法）
-func (m *Manager) ReplaceByToken(ctx context.Context, tokenValue string) error {
-	return m.replaceByToken(ctx, tokenValue)
+// ReplaceByDeviceAndDeviceId user offline by DeviceAndDeviceId | 根据设备类型和设备ID顶人下线
+func (m *Manager) ReplaceByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
 }
 
 // ============ Token Validation | Token验证 ============
 
 // IsLogin Checks if the user is logged in | 检查用户是否登录
-func (m *Manager) IsLogin(ctx context.Context, tokenValue string) (bool, error) {
-	info, err := m.getTokenInfo(ctx, tokenValue, true)
+func (m *Manager) IsLogin(ctx context.Context, tokenValue string) bool {
+	// Get token info | 获取Token信息
+	info, err := m.getTokenInfo(ctx, tokenValue)
 	if err != nil {
-		return false, err
+		return false
 	}
 
 	// Check if the token has exceeded the active timeout | 检查Token是否超过活跃超时时间
 	if m.config.ActiveTimeout > 0 {
 		now := time.Now().Unix()
 		if now-info.ActiveTime > m.config.ActiveTimeout {
-			// Force logout and clean up token data | 强制登出并清理Token相关数据
-			_ = m.removeTokenChain(ctx, tokenValue, info, listener.EventKickout)
-			return false, core.ErrTokenKickout
+			// 设置TokenInfo为踢下线并且删除session中列表的设备
+			_ = m.removeTokenChain(ctx, tokenValue, nil, nil, listener.EventKickout)
+			return false
 		}
 	}
 
-	// Async auto-renew for better performance | 异步自动续期（提高性能）
+	// 判断是否允许续期
 	if m.config.AutoRenew && m.config.Timeout > 0 {
-		// Construct the token storage key | 构造Token存储键
+		// Get token key | 获取TokenKey
 		tokenKey := m.getTokenKey(tokenValue)
-
 		// Check if token renewal is needed | 检查是否需要进行续期
 		if ttl, err := m.storage.TTL(ctx, tokenKey); err == nil {
 			ttlSeconds := int64(ttl.Seconds())
-
 			// Perform renewal if TTL is below MaxRefresh threshold and RenewInterval allows | 如果TTL小于MaxRefresh阈值且RenewInterval允许，则进行续期
 			if ttlSeconds > 0 && (m.config.MaxRefresh <= 0 || ttlSeconds <= m.config.MaxRefresh) && (m.config.RenewInterval <= 0 || !m.storage.Exists(ctx, m.getRenewKey(tokenValue))) {
-				renewFunc := func() { m.renewToken(context.Background(), tokenValue, info) }
-
+				// 构造续期函数
+				renewFunc := func() {
+					m.renewToken(context.Background(), tokenValue, info)
+				}
 				// Submit renewal task to the pool if configured, otherwise use a goroutine | 如果配置了续期池，则提交续期任务到池中，否则使用协程
 				if m.pool != nil {
 					_ = m.pool.Submit(renewFunc) // Submit token renewal task to the pool | 提交Token续期任务到续期池
@@ -447,20 +381,17 @@ func (m *Manager) IsLogin(ctx context.Context, tokenValue string) (bool, error) 
 		}
 	}
 
-	return true, nil
+	return true
 }
 
-// CheckLogin Checks login status | 检查登录
+// CheckLogin Checks if the user is logged in | 检查用户是否登录
 func (m *Manager) CheckLogin(ctx context.Context, tokenValue string) error {
-	isLogin, err := m.IsLogin(ctx, tokenValue)
-	if err != nil {
-		return err
-	}
-	if !isLogin {
-		return core.ErrTokenExpired
-	}
 
-	return nil
+}
+
+// IsLoginByDeviceAndDeviceId Checks if the user is logged in by DeviceAndDeviceId | 根据设备类型和设备ID检查用户是否登录
+func (m *Manager) IsLoginByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) error {
+
 }
 
 // ============ Token Information | Token信息与解析 ============
@@ -480,7 +411,7 @@ func (m *Manager) GetLoginID(ctx context.Context, tokenValue string) (string, er
 	return m.GetLoginIDNotCheck(ctx, tokenValue)
 }
 
-// GetLoginIDNotCheck Gets login ID without checking token validity | 获取登录ID 不续期Token
+// GetLoginIDNotCheck Gets login ID without checking token validity | 获取登录ID 不验证和续期Token
 func (m *Manager) GetLoginIDNotCheck(ctx context.Context, tokenValue string) (string, error) {
 	// Get token info | 获取Token信息
 	info, err := m.getTokenInfo(ctx, tokenValue)
@@ -491,32 +422,13 @@ func (m *Manager) GetLoginIDNotCheck(ctx context.Context, tokenValue string) (st
 	return info.LoginID, nil
 }
 
-// GetTokenValue Gets token by login ID and device | 根据登录ID以及设备获取Token
-func (m *Manager) GetTokenValue(ctx context.Context, loginID string, device ...string) (string, error) {
-	// Construct the account storage key | 构造账号存储键
-	accountKey := m.getAccountKey(loginID, getDevice(device))
-
-	// Retrieve the token value from storage | 从存储中获取Token值
-	tokenValue, err := m.storage.Get(ctx, accountKey)
-	if err != nil {
-		return "", core.ErrStorageUnavailable
-	}
-	if tokenValue == nil {
-		return "", core.ErrTokenNotFound
-	}
-
-	// Assert token value as a string | 断言Token值为字符串
-	tokenValueStr, ok := assertString(tokenValue)
-	if !ok {
-		return "", core.ErrTokenNotFound
-	}
-
-	return tokenValueStr, nil
+// GetTokenInfo Gets token information | 获取Token信息
+func (m *Manager) GetTokenInfo(ctx context.Context, tokenValue string) (*TokenInfo, error) {
+	return m.getTokenInfo(ctx, tokenValue)
 }
 
-// GetTokenInfoByToken Gets token information | 获取Token信息
-func (m *Manager) GetTokenInfoByToken(ctx context.Context, tokenValue string) (*TokenInfo, error) {
-	return m.getTokenInfo(ctx, tokenValue)
+// GetTokenInfoByDeviceAndDeviceId Gets token information by DeviceAndDeviceId | 根据设备类型和设备ID获取Token信息
+func (m *Manager) GetTokenInfoByDeviceAndDeviceId(ctx context.Context, deviceAndDeviceId ...string) (*TokenInfo, error) {
 }
 
 // ============ Account Disable | 账号封禁 ============
@@ -575,11 +487,8 @@ func (m *Manager) Untie(ctx context.Context, loginID string) error {
 
 // IsDisable Checks if account is disabled | 检查账号是否被封禁
 func (m *Manager) IsDisable(ctx context.Context, loginID string) bool {
-	// Retrieve the disable flag storage key | 获取封禁标记的存储键
-	disableKeyKey := m.getDisableKey(loginID)
-
 	// Check if the disable flag exists in storage | 检查封禁标记是否存在
-	return m.storage.Exists(ctx, disableKeyKey)
+	return m.storage.Exists(ctx, m.getDisableKey(loginID))
 }
 
 // GetDisableInfo get disable info | 获取封禁信息
@@ -612,7 +521,7 @@ func (m *Manager) GetDisableInfo(ctx context.Context, loginID string) (*DisableI
 	return &disableInfo, nil
 }
 
-// GetDisableTTL Gets remaining disable time in seconds | 获取账号剩余封禁时间（秒）
+// GetDisableTTL Gets remaining disable time in | 获取账号剩余封禁时间
 func (m *Manager) GetDisableTTL(ctx context.Context, loginID string) (int64, error) {
 	// Retrieve the disable flag storage key | 获取封禁标记的存储键
 	disableKeyKey := m.getDisableKey(loginID)
@@ -629,91 +538,89 @@ func (m *Manager) GetDisableTTL(ctx context.Context, loginID string) (int64, err
 
 // ============ Session Management | Session管理 ============
 
-// GetSession gets session by login ID | 获取 Session
+// GetSession gets session by login ID | 获取Session
 func (m *Manager) GetSession(ctx context.Context, loginID string) (*session.Session, error) {
-	if loginID == "" {
-		return nil, core.ErrSessionIDEmpty
-	}
-
+	// Construct the session storage key | 构造Session存储键
 	key := m.config.KeyPrefix + m.config.AuthType + session.SessionKeyPrefix + loginID
+
+	// Retrieve session data from storage | 从存储中获取Session数据
 	data, err := m.storage.Get(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 	}
-
-	// If found, decode session | 如果找到 Session 则解码
-	var sess *session.Session
-	if data != nil {
-		raw, err := utils.ToBytes(data)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", core.ErrTypeConvert, err)
-		}
-
-		sess = &session.Session{}
-		if err := m.serializer.Decode(raw, sess); err != nil {
-			return nil, fmt.Errorf("%w: %v", core.ErrDeserializeFailed, err)
-		}
-
-		// Set internal dependencies after decoding | 解码后设置内部依赖
-		sess.SetDependencies(m.config.KeyPrefix, m.storage, m.serializer)
+	// 如果数据为空，则返回一个新的Session对象
+	if data == nil {
+		sess := session.NewSession(m.config.AuthType, m.config.KeyPrefix, loginID, m.storage, m.serializer)
+		return sess, nil
 	}
 
-	// If not exist, create new session | 没找到就创建新的 Session
-	if sess == nil {
-		sess = session.NewSession(m.config.AuthType, m.config.KeyPrefix, loginID, m.storage, m.serializer)
+	// 将数据转换为字节数组
+	raw, err := utils.ToBytes(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", core.ErrTypeConvert, err)
 	}
 
-	return sess, nil
+	// 反序列化Session数据
+	var sess session.Session
+	if err = m.serializer.Decode(raw, &sess); err != nil {
+		return nil, fmt.Errorf("%w: %v", core.ErrDeserializeFailed, err)
+	}
+
+	// Set internal dependencies after decoding | 解码后设置内部依赖
+	sess.SetDependencies(m.config.KeyPrefix, m.storage, m.serializer)
+
+	return &sess, nil
 }
 
-// GetSessionByToken Gets session by token | 根据Token获取Session
+// GetSessionByToken Gets session by token value | 通过Token值获取Session
 func (m *Manager) GetSessionByToken(ctx context.Context, tokenValue string) (*session.Session, error) {
-	loginID, err := m.GetLoginIDNotCheck(ctx, tokenValue)
+	tokenInfo, err := m.getTokenInfo(ctx, tokenValue)
 	if err != nil {
 		return nil, err
 	}
-
-	return m.GetSession(ctx, loginID)
+	return m.GetSession(ctx, tokenInfo.LoginID)
 }
 
-// DeleteSession Deletes session | 删除Session
-func (m *Manager) DeleteSession(ctx context.Context, loginID string) error {
-	sess, err := m.GetSession(ctx, loginID)
+// ============ Token & Session Info | Token 与会话信息查询 ============
+
+// GetTokenValueListByLoginID Gets all tokens for specified account | 获取指定账号的所有Token
+func (m *Manager) GetTokenValueListByLoginID(ctx context.Context, loginID string) ([]string, error) {
+	// Construct the pattern for account key | 构造账号存储键的匹配模式
+	pattern := m.config.KeyPrefix + m.config.AuthType + AccountKeyPrefix + loginID + TokenValueListLastKey
+
+	// Retrieve keys matching the pattern from storage | 从存储中获取匹配的键
+	keys, err := m.storage.Keys(ctx, pattern)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 	}
 
-	return sess.Destroy(ctx)
+	// Initialize a slice to hold the token strings | 初始化切片来存储Token字符串
+	tokens := make([]string, 0, len(keys))
+
+	// Loop through the keys and retrieve the associated token values | 遍历键并获取关联的Token值
+	for _, key := range keys {
+		value, err := m.storage.Get(ctx, key)
+		if err == nil && value != nil {
+			// Assert value as string and add to tokens slice | 将值断言为字符串并添加到Token切片
+			if tokenStr, ok := assertString(value); ok {
+				// Get the token info from storage | 从存储中获取Token信息
+				tokenInfo, err := m.storage.Get(ctx, m.getTokenKey(tokenStr))
+				if err == nil && tokenInfo != nil {
+					tokenInfoStr, assertOk := assertString(tokenInfo)
+					if assertOk && tokenInfoStr != string(TokenStateKickout) && tokenInfoStr != string(TokenStateReplaced) {
+						tokens = append(tokens, tokenStr)
+					}
+				}
+			}
+		}
+	}
+
+	// Return the list of token strings | 返回Token字符串列表
+	return tokens, nil
 }
 
-// DeleteSessionByToken Deletes session by token | 根据Token删除Session
-func (m *Manager) DeleteSessionByToken(ctx context.Context, tokenValue string) error {
-	sess, err := m.GetSessionByToken(ctx, tokenValue)
-	if err != nil {
-		return err
-	}
-
-	return sess.Destroy(ctx)
-}
-
-// HasSession Checks if session exists | 检查Session是否存在
-func (m *Manager) HasSession(ctx context.Context, loginID string) bool {
-	if loginID == "" {
-		return false
-	}
-
-	key := m.config.KeyPrefix + m.config.AuthType + session.SessionKeyPrefix + loginID
-	return m.GetStorage().Exists(ctx, key)
-}
-
-// RenewSession Renews session TTL | 续期Session
-func (m *Manager) RenewSession(ctx context.Context, loginID string, ttl time.Duration) error {
-	sess, err := m.GetSession(ctx, loginID)
-	if err != nil {
-		return err
-	}
-
-	return sess.Renew(ctx, ttl)
+// GetTokenValueListByDeviceAndDeviceId Gets all tokens for specified device and device ID | 获取指定设备类型和设备ID的所有Token
+func (m *Manager) GetTokenValueListByDeviceAndDeviceId(ctx context.Context, loginID string, deviceAndDeviceId ...string) ([]string, error) {
 }
 
 // ============ Permission Validation | 权限验证 ============
@@ -1138,143 +1045,39 @@ func (m *Manager) hasRoleInList(roles []string, role string) bool {
 // ============ Token Tags | Token标签 ============
 
 // SetTokenTag Sets token tag | 设置Token标签
-func (m *Manager) SetTokenTag(tag string) error {
-	// Tag feature not supported to comply with Java sa-token design
-	// If you need custom metadata, use Session instead
-	return fmt.Errorf("token tag feature not supported (use Session for custom metadata)")
+func (m *Manager) SetTokenTag(ctx context.Context, tokenValue, tag string) error {
+	// Get token info | 获取Token信息
+	tokenInfo, err := m.getTokenInfo(ctx, tokenValue)
+	if err != nil {
+		return err
+	}
+	tokenInfo.Tag = tag
+	tokenInfo.ActiveTime = time.Now().Unix()
+
+	// Encode token info | 编码Token信息
+	encodeData, err := m.serializer.Encode(tokenInfo)
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrSerializeFailed, err)
+	}
+
+	// Save token info | 保存Token信息
+	err = m.storage.Set(ctx, m.getTokenKey(tokenValue), encodeData, m.getExpiration())
+	if err != nil {
+		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+	}
+
+	return nil
 }
 
 // GetTokenTag Gets token tag | 获取Token标签
-func (m *Manager) GetTokenTag(ctx context.Context) (string, error) {
-	// Tag feature not supported to comply with Java sa-token design
-	return "", fmt.Errorf("token tag feature not supported (use Session for custom metadata)")
-}
-
-// ============ Token & Session Info | Token 与会话信息查询 ============
-
-// GetTokenValueListByLoginID Gets all tokens for specified account | 获取指定账号的所有Token
-func (m *Manager) GetTokenValueListByLoginID(ctx context.Context, loginID string) ([]string, error) {
-	// Construct the pattern for account key | 构造账号存储键的匹配模式
-	pattern := m.config.KeyPrefix + m.config.AuthType + AccountKeyPrefix + loginID + TokenValueListLastKey
-
-	// Retrieve keys matching the pattern from storage | 从存储中获取匹配的键
-	keys, err := m.storage.Keys(ctx, pattern)
+func (m *Manager) GetTokenTag(ctx context.Context, tokenValue string) (string, error) {
+	// Get token info | 获取Token信息
+	tokenInfo, err := m.getTokenInfo(ctx, tokenValue)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+		return "", err
 	}
 
-	// Initialize a slice to hold the token strings | 初始化切片来存储Token字符串
-	tokens := make([]string, 0, len(keys))
-
-	// Loop through the keys and retrieve the associated token values | 遍历键并获取关联的Token值
-	for _, key := range keys {
-		value, err := m.storage.Get(ctx, key)
-		if err == nil && value != nil {
-			// Assert value as string and add to tokens slice | 将值断言为字符串并添加到Token切片
-			if tokenStr, ok := assertString(value); ok {
-				// Get the token info from storage | 从存储中获取Token信息
-				tokenInfo, err := m.storage.Get(ctx, m.getTokenKey(tokenStr))
-				if err == nil && tokenInfo != nil {
-					tokenInfoStr, assertOk := assertString(tokenInfo)
-					if assertOk && tokenInfoStr != string(TokenStateKickout) && tokenInfoStr != string(TokenStateReplaced) {
-						tokens = append(tokens, tokenStr)
-					}
-				}
-			}
-		}
-	}
-
-	// Return the list of token strings | 返回Token字符串列表
-	return tokens, nil
-}
-
-// GetSessionCountByLoginID Gets session count for specified account | 获取指定账号的Session数量
-func (m *Manager) GetSessionCountByLoginID(ctx context.Context, loginID string) (int, error) {
-	// Get the list of token values for the specified login ID | 获取指定登录ID的Token值列表
-	tokens, err := m.GetTokenValueListByLoginID(ctx, loginID)
-	if err != nil {
-		return 0, err // Return error if token list retrieval fails | 如果获取Token列表失败，则返回错误
-	}
-
-	// Return the count of tokens as the session count | 返回Token数量作为Session数量
-	return len(tokens), nil
-}
-
-// ============ Event Management | 事件管理 ============
-
-// RegisterFunc registers a function as an event listener | 注册函数作为事件监听器
-func (m *Manager) RegisterFunc(event listener.Event, fn func(*listener.EventData)) {
-	m.eventManager.RegisterFunc(event, fn)
-}
-
-// Register registers an event listener | 注册事件监听器
-func (m *Manager) Register(event listener.Event, listener listener.Listener) string {
-	return m.eventManager.Register(event, listener)
-}
-
-// RegisterWithConfig registers an event listener with config | 注册带配置的事件监听器
-func (m *Manager) RegisterWithConfig(event listener.Event, listener listener.Listener, config listener.ListenerConfig) string {
-	return m.eventManager.RegisterWithConfig(event, listener, config)
-}
-
-// Unregister removes an event listener by ID | 根据ID移除事件监听器
-func (m *Manager) Unregister(id string) bool {
-	return m.eventManager.Unregister(id)
-}
-
-// TriggerEvent manually triggers an event | 手动触发事件
-func (m *Manager) TriggerEvent(data *listener.EventData) {
-	m.eventManager.Trigger(data)
-}
-
-// TriggerEventAsync triggers an event asynchronously and returns immediately | 异步触发事件并立即返回
-func (m *Manager) TriggerEventAsync(data *listener.EventData) {
-	m.eventManager.TriggerAsync(data)
-}
-
-// TriggerEventSync triggers an event synchronously and waits for all listeners | 同步触发事件并等待所有监听器完成
-func (m *Manager) TriggerEventSync(data *listener.EventData) {
-	m.eventManager.TriggerSync(data)
-}
-
-// WaitEvents waits for all async event listeners to complete | 等待所有异步事件监听器完成
-func (m *Manager) WaitEvents() {
-	m.eventManager.Wait()
-}
-
-// ClearEventListeners removes all listeners for a specific event | 清除指定事件的所有监听器
-func (m *Manager) ClearEventListeners(event listener.Event) {
-	m.eventManager.ClearEvent(event)
-}
-
-// ClearAllEventListeners removes all listeners | 清除所有事件监听器
-func (m *Manager) ClearAllEventListeners() {
-	m.eventManager.Clear()
-}
-
-// CountEventListeners returns the number of listeners for a specific event | 获取指定事件监听器数量
-func (m *Manager) CountEventListeners(event listener.Event) int {
-	return m.eventManager.CountForEvent(event)
-}
-
-// CountAllListeners returns the total number of registered listeners | 获取已注册监听器总数
-func (m *Manager) CountAllListeners() int {
-	return m.eventManager.Count()
-}
-
-// GetEventListenerIDs returns all listener IDs for a specific event | 获取指定事件的所有监听器ID
-func (m *Manager) GetEventListenerIDs(event listener.Event) []string {
-	return m.eventManager.GetListenerIDs(event)
-}
-
-// GetAllRegisteredEvents returns all events that have registered listeners | 获取所有已注册事件
-func (m *Manager) GetAllRegisteredEvents() []listener.Event {
-	return m.eventManager.GetAllEvents()
-}
-
-// HasEventListeners checks if there are any listeners for a specific event | 检查指定事件是否有监听器
-func (m *Manager) HasEventListeners(event listener.Event) bool {
-	return m.eventManager.HasListeners(event)
+	return tokenInfo.Tag, nil
 }
 
 // ============ Security Features | 安全特性 ============
@@ -1457,14 +1260,6 @@ func (m *Manager) GetOAuth2Server() *oauth2.OAuth2Server {
 	return m.oauth2Server
 }
 
-// GetDevice extracts device type from optional parameter | 从可选参数中提取设备类型 公开方法
-func (m *Manager) GetDevice(device []string) string {
-	if len(device) > 0 && strings.TrimSpace(device[0]) != "" {
-		return device[0]
-	}
-	return DefaultDevice
-}
-
 // ============ Internal Methods | 内部方法 ============
 
 // getTokenInfo Gets token information by token value | 通过Token值获取Token信息
@@ -1472,21 +1267,26 @@ func (m *Manager) getTokenInfo(ctx context.Context, tokenValue string, checkStat
 	// Retrieve data from storage using the token key | 使用Token键从存储中获取数据
 	data, err := m.storage.Get(ctx, m.getTokenKey(tokenValue))
 	if err != nil {
+		m.logger.Errorf("Manager getTokenInfo err: %v", err)
 		return nil, fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 	}
+	// If data is nil, the token is expired | 如果数据为nil，则Token已过期
 	if data == nil {
-		return nil, core.ErrTokenNotFound
+		return nil, core.ErrTokenExpired
 	}
 
 	// Convert data to raw byte slice | 将数据转换为原始字节切片
 	raw, err := utils.ToBytes(data)
 	if err != nil {
+		m.logger.Errorf("Manager getTokenInfo err: %v", err)
 		return nil, fmt.Errorf("%w: %v", core.ErrTypeConvert, err)
 	}
 
 	// Check for special token states (if enabled) | 检查是否为特殊状态
 	if len(checkState) > 0 && checkState[0] {
 		switch string(raw) {
+		case string(TokenStateLogout):
+			return nil, core.ErrTokenExpired
 		case string(TokenStateKickout):
 			return nil, core.ErrTokenKickout
 		case string(TokenStateReplaced):
@@ -1497,6 +1297,7 @@ func (m *Manager) getTokenInfo(ctx context.Context, tokenValue string, checkStat
 	// Parse TokenInfo | 解析Token信息
 	var info TokenInfo
 	if err = m.serializer.Decode(raw, &info); err != nil {
+		m.logger.Errorf("Manager getTokenInfo err: %v", err)
 		return nil, fmt.Errorf("%w: %v", core.ErrDeserializeFailed, err)
 	}
 
@@ -1504,44 +1305,55 @@ func (m *Manager) getTokenInfo(ctx context.Context, tokenValue string, checkStat
 }
 
 // renewToken Renews token expiration asynchronously | 异步续期Token
-func (m *Manager) renewToken(ctx context.Context, tokenValue string, info *TokenInfo) error {
-	// Before renewing the token, check if the user is disabled | 在续期之前，先检查用户是否被禁用
-	if m.IsDisable(ctx, info.LoginID) {
-		return core.ErrAccountDisabled
-	}
-
-	// If info is nil, retrieve token information | 如果info为空，获取Token信息
+func (m *Manager) renewToken(ctx context.Context, tokenValue string, info *TokenInfo, sess *session.Session) {
+	// Get token info if not provided | 如果未提供Token信息，则获取Token信息
 	if info == nil {
 		var err error
 		if info, err = m.getTokenInfo(ctx, tokenValue); err != nil {
-			return err
+			m.logger.Errorf("Manager renewToken getTokenInfo err: %v", err)
+			return
 		}
 	}
 
+	// Get session if not provided | 如果未提供Session，则获取Session
+	if sess == nil {
+		var err error
+		sess, err = m.GetSession(ctx, info.LoginID)
+		if err != nil {
+			m.logger.Errorf("Manager renewToken GetSession err: %v", err)
+			return
+		}
+	}
+
+	// Before renewing the token, check if the user is disabled | 在续期之前，先检查用户是否被禁用
+	if m.IsDisable(ctx, info.LoginID) {
+		m.logger.Warnf("Manager renewToken: user %s is disabled", info.LoginID)
+		return
+	}
+
 	// Get expiration time | 获取过期时间
-	exp := m.getExpiration()
+	expiration := m.getExpiration()
 	// Update ActiveTime | 更新ActiveTime
 	info.ActiveTime = time.Now().Unix()
 
-	// Renew token TTL | 续期Token的TTL
+	// Encode token info
 	tokenInfo, err := m.serializer.Encode(info)
 	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrSerializeFailed, err)
+		m.logger.Errorf("Manager renewToken Encode TokenInfo err: %v", err)
+		return
 	}
-	err = m.storage.Set(ctx, m.getTokenKey(tokenValue), tokenInfo, exp)
+	// Renew token TTL | 续期Token的TTL
+	err = m.storage.Set(ctx, m.getTokenKey(tokenValue), tokenInfo, expiration)
 	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
-	}
-
-	// Renew accountKey TTL | 续期账号映射的TTL
-	err = m.storage.Expire(ctx, m.getAccountKey(info.LoginID, info.Device), exp)
-	if err != nil {
-		return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+		m.logger.Errorf("Manager renewToken Storage TokenInfo err: %v", err)
+		return
 	}
 
 	// Renew session TTL | 续期Session的TTL
-	if err = m.RenewSession(ctx, info.LoginID, exp); err != nil {
-		return err
+	err = sess.Renew(ctx, expiration)
+	if err != nil {
+		m.logger.Errorf("Manager renewToken Session Renew err: %v", err)
+		return
 	}
 
 	// Set minimal renewal interval marker | 设置最小续期间隔标记
@@ -1553,27 +1365,32 @@ func (m *Manager) renewToken(ctx context.Context, tokenValue string, info *Token
 			time.Duration(m.config.RenewInterval)*time.Second,
 		)
 		if err != nil {
-			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+			m.logger.Errorf("Manager renewToken Storage RenewInterval err: %v", err)
+			return
 		}
 	}
-
-	return nil
 }
 
 // removeTokenChain Removes all related keys and triggers event | 删除Token相关的所有键并触发事件
-func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, info *TokenInfo, event listener.Event, destroySession ...bool) error {
-	// If info is nil, retrieve token information | 如果info为空，获取Token信息
-	if info == nil {
+func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, tokenInfo *TokenInfo, sess *session.Session, event listener.Event) error {
+	// Get token info if not provided | 如果未提供Token信息，则获取Token信息
+	if tokenInfo == nil {
 		var err error
-		if info, err = m.getTokenInfo(ctx, tokenValue); err != nil {
+		if tokenInfo, err = m.getTokenInfo(ctx, tokenValue); err != nil {
+			return err
+		}
+	}
+
+	// Get session if not provided | 如果未提供Session，则获取Session
+	if sess == nil {
+		var err error
+		if sess, err = m.GetSession(ctx, tokenValue); err != nil {
 			return err
 		}
 	}
 
 	// Construct the token storage key | 构造Token存储键
 	tokenKey := m.getTokenKey(tokenValue)
-	// Construct the account storage key | 构造账号存储键
-	accountKey := m.getAccountKey(info.LoginID, info.Device)
 	// Construct the renewal key | 构造续期标记
 	renewKey := m.getRenewKey(tokenValue)
 
@@ -1582,16 +1399,15 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, info 
 
 	// EventLogout User logout | 用户主动登出
 	case listener.EventLogout:
-		// Delete token, account mapping, and renew key | 删除Token、账号映射和续期标记
-		err := m.storage.Delete(ctx, tokenKey, accountKey, renewKey)
+		// Delete token and renew key | 删除Token和续期标记
+		err := m.storage.Delete(ctx, tokenKey, renewKey)
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		if len(destroySession) > 0 && destroySession[0] {
-			err = m.DeleteSession(ctx, info.LoginID)
-			if err != nil {
-				return err
-			}
+		// Remove terminal by token | 根据Token删除终端信息
+		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
+		if err != nil {
+			return err
 		}
 
 	// EventKickout User kicked offline | 用户被踢下线
@@ -1601,37 +1417,35 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, info 
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		// Delete account mapping, renew key | 删除账号映射、续期标记
-		err = m.storage.Delete(ctx, accountKey, renewKey)
+		// Remove terminal by token | 根据Token删除终端信息
+		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
 		if err != nil {
-			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+			return err
 		}
 
-	// EventReplace User replaced by new login (keep session) | 用户被顶下线（保留Session，自动过期）
+	// EventReplace User replaced by new login | 用户被顶下线
 	case listener.EventReplace:
 		// Mark as replaced but keep TTL | 标记为被顶下线，保留原TTL
 		err := m.storage.SetKeepTTL(ctx, tokenKey, string(TokenStateReplaced))
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		// Delete account mapping, renew key | 删除账号映射、续期标记
-		err = m.storage.Delete(ctx, accountKey, renewKey)
+		// Remove terminal by token | 根据Token删除终端信息
+		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
 		if err != nil {
-			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
+			return err
 		}
 
 	// Default Unknown event type | 未知事件类型（默认删除）
 	default:
-		// Delete token, account mapping, and renew key | 删除Token、账号映射和续期标记
-		err := m.storage.Delete(ctx, tokenKey, accountKey, renewKey)
+		// Delete token and renew key | 删除Token和续期标记
+		err := m.storage.Delete(ctx, tokenKey, renewKey)
 		if err != nil {
 			return fmt.Errorf("%w: %v", core.ErrStorageUnavailable, err)
 		}
-		if len(destroySession) > 0 && destroySession[0] {
-			err = m.DeleteSession(ctx, info.LoginID)
-			if err != nil {
-				return err
-			}
+		err = sess.RemoveTerminalByToken(ctx, tokenValue, m.getExpiration())
+		if err != nil {
+			return err
 		}
 	}
 
@@ -1640,8 +1454,8 @@ func (m *Manager) removeTokenChain(ctx context.Context, tokenValue string, info 
 		m.eventManager.Trigger(&listener.EventData{
 			Event:    event,
 			AuthType: m.config.AuthType,
-			LoginID:  info.LoginID,
-			Device:   info.Device,
+			LoginID:  tokenInfo.LoginID,
+			Device:   tokenInfo.Device,
 			Token:    tokenValue,
 		})
 	}
@@ -1656,11 +1470,6 @@ func (m *Manager) getTokenKey(tokenValue string) string {
 	return m.config.KeyPrefix + m.config.AuthType + TokenKeyPrefix + tokenValue
 }
 
-// getAccountKey Gets account storage key | 获取账号存储键
-func (m *Manager) getAccountKey(loginID, device string) string {
-	return m.config.KeyPrefix + m.config.AuthType + AccountKeyPrefix + loginID + PermissionSeparator + device
-}
-
 // getRenewKey Gets token renewal tracking key | 获取Token续期追踪键
 func (m *Manager) getRenewKey(tokenValue string) string {
 	return m.config.KeyPrefix + m.config.AuthType + RenewKeyPrefix + tokenValue
@@ -1671,14 +1480,6 @@ func (m *Manager) getDisableKey(loginID string) string {
 	return m.config.KeyPrefix + m.config.AuthType + DisableKeyPrefix + loginID
 }
 
-// getDevice extracts device type from optional parameter | 从可选参数中提取设备类型
-func getDevice(device []string) string {
-	if len(device) > 0 && strings.TrimSpace(device[0]) != "" {
-		return device[0]
-	}
-	return DefaultDevice
-}
-
 // getExpiration calculates expiration duration from config | 从配置计算过期时间
 func (m *Manager) getExpiration() time.Duration {
 	if m.config.Timeout > 0 {
@@ -1687,10 +1488,12 @@ func (m *Manager) getExpiration() time.Duration {
 	return 0
 }
 
-// assertString asserts value as string safely | 安全断言值为字符串
-func assertString(v any) (string, bool) {
-	s, ok := v.(string)
-	return s, ok
+// getDevice extracts device type from optional parameter | 从可选参数中提取设备类型
+func (m *Manager) getDevice(device ...string) string {
+	if len(device) > 0 && strings.TrimSpace(device[0]) != "" {
+		return device[0]
+	}
+	return DefaultDevice
 }
 
 // toStringSlice Converts any to []string | 将any转换为[]string
@@ -1723,4 +1526,10 @@ func removeDuplicateStrings(list []string) []string {
 		}
 	}
 	return result
+}
+
+// assertString asserts value as string safely | 安全断言值为字符串
+func assertString(v any) (string, bool) {
+	s, ok := v.(string)
+	return s, ok
 }
