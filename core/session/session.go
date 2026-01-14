@@ -28,8 +28,9 @@ type Session struct {
 
 // TerminalInfo terminal information | 终端信息
 type TerminalInfo struct {
-	Token  string `json:"token"`  // Token value | 令牌
-	Device string `json:"device"` // Device type | 设备类型
+	Token    string `json:"token"`    // Token value | 令牌
+	Device   string `json:"device"`   // Device type | 设备类型
+	DeviceId string `json:"deviceId"` // Device ID | 设备ID
 }
 
 // NewSession Creates a new session | 创建新的Session
@@ -74,6 +75,84 @@ func (s *Session) SetDependencies(prefix string, storage adapter.Storage, serial
 }
 
 // ============ Data Operations | 数据操作 ============
+
+// Get returns stored session values by key.
+func (s *Session) Get(key string) (any, bool) {
+	if key == "" {
+		return nil, false
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	switch key {
+	case "permissions":
+		return append([]string(nil), s.Permissions...), true
+	case "roles":
+		return append([]string(nil), s.Roles...), true
+	case "loginId":
+		return s.ID, true
+	case "loginTime":
+		return s.CreateTime, true
+	default:
+		return nil, false
+	}
+}
+
+// Set updates stored session values by key.
+func (s *Session) Set(ctx context.Context, key string, value any, ttl ...time.Duration) error {
+	if key == "" {
+		return core.ErrSessionInvalidDataKey
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch key {
+	case "permissions":
+		s.Permissions = toStringSlice(value)
+	case "roles":
+		s.Roles = toStringSlice(value)
+	case "loginId":
+		if v, ok := value.(string); ok {
+			s.ID = v
+		} else {
+			return core.ErrSessionInvalidDataKey
+		}
+	case "loginTime":
+		switch v := value.(type) {
+		case int64:
+			s.CreateTime = v
+		case int:
+			s.CreateTime = int64(v)
+		case float64:
+			s.CreateTime = int64(v)
+		default:
+			return core.ErrSessionInvalidDataKey
+		}
+	default:
+		return core.ErrSessionInvalidDataKey
+	}
+
+	return s.save(ctx, ttl...)
+}
+
+func toStringSlice(v any) []string {
+	switch val := v.(type) {
+	case []string:
+		return append([]string(nil), val...)
+	case []any:
+		result := make([]string, 0, len(val))
+		for _, item := range val {
+			if str, ok := item.(string); ok && str != "" {
+				result = append(result, str)
+			}
+		}
+		return result
+	default:
+		return []string{}
+	}
+}
 
 // AddPermissions adds permissions | 新增权限
 func (s *Session) AddPermissions(ctx context.Context, permissions []string, ttl ...time.Duration) error {
@@ -316,25 +395,26 @@ func (s *Session) RemoveTerminalByToken(ctx context.Context, token string, ttl .
 	return s.save(ctx, ttl...)
 }
 
-// RemoveTerminalInfosByDevice removes terminals by device, preserving the order of remaining terminals | 根据设备类型删除终端信息，保留剩余终端的原有顺序
-func (s *Session) RemoveTerminalInfosByDevice(ctx context.Context, device string, ttl ...time.Duration) error {
+// RemoveTerminalInfosByDevice removes terminals by device and returns deleted tokens | 按设备类型删除终端并返回被清除的Token列表
+func (s *Session) RemoveTerminalInfosByDevice(ctx context.Context, device string, ttl ...time.Duration) ([]string, error) {
 	if device == "" {
-		return nil
+		return nil, nil
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.TerminalInfos) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	w := 0
-	found := false
+	var removedTokens []string
+
 	for r := 0; r < len(s.TerminalInfos); r++ {
 		if s.TerminalInfos[r].Device == device {
-			found = true
-			continue // 跳过要删除的
+			removedTokens = append(removedTokens, s.TerminalInfos[r].Token)
+			continue
 		}
 		if w != r {
 			s.TerminalInfos[w] = s.TerminalInfos[r]
@@ -342,11 +422,53 @@ func (s *Session) RemoveTerminalInfosByDevice(ctx context.Context, device string
 		w++
 	}
 
-	if !found {
-		return nil
+	if len(removedTokens) == 0 {
+		return nil, nil
 	}
 
-	s.TerminalInfos = s.TerminalInfos[:w] // 截断，保持顺序
+	s.TerminalInfos = s.TerminalInfos[:w]
+
+	err := s.save(ctx, ttl...)
+	return removedTokens, err
+}
+
+// ReplaceTerminals replaces all terminal infos with the provided list | 替换所有终端信息为新列表
+func (s *Session) ReplaceTerminals(ctx context.Context, terminals []TerminalInfo, ttl ...time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 如果新列表为空，直接清空
+	if len(terminals) == 0 {
+		if len(s.TerminalInfos) == 0 {
+			return nil // 无需保存
+		}
+		s.TerminalInfos = make([]TerminalInfo, 0)
+		return s.save(ctx, ttl...)
+	}
+
+	// 深拷贝一份（避免外部修改影响内部状态）
+	newList := make([]TerminalInfo, len(terminals))
+	for i, t := range terminals {
+		// 可选：跳过 Token 为空的终端（保持一致性，与 AddTerminal 行为一致）
+		if t.Token == "" {
+			continue
+		}
+		newList[i] = t
+	}
+
+	// 实际写入数量可能因跳过空 Token 而减少
+	// 重新切片以去除跳过的项（如果需要严格过滤）
+	filtered := make([]TerminalInfo, 0, len(terminals))
+	for _, t := range terminals {
+		if t.Token != "" {
+			filtered = append(filtered, t)
+		}
+	}
+
+	// 判断是否内容真正发生变化（可选优化）
+	// 简化处理：直接赋值并保存（除非性能敏感，否则可接受）
+
+	s.TerminalInfos = filtered
 	return s.save(ctx, ttl...)
 }
 
