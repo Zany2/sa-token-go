@@ -14,6 +14,7 @@ const (
 	TokenKeyPrefix        = "token:"   // Token storage prefix | Token 存储前缀
 	AccountKeyPrefix      = "account:" // Account storage prefix | 账号存储前缀
 	DisableKeyPrefix      = "disable:" // Disable state prefix | 禁用状态存储前缀
+	SessionKeyPrefix      = "session:" // Storage key prefix | 存储键前缀
 	RenewKeyPrefix        = "renew:"   // Token renew prefix | Token 续期存储前缀
 	TokenValueListLastKey = ":*"
 
